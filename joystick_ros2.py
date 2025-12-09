@@ -19,6 +19,8 @@ from math import modf
 import rclpy
 from rclpy.node import Node
 
+import threading
+import queue
 from sensor_msgs.msg import Joy
 from std_msgs.msg import Header
 from inputs import devices, UnpluggedError
@@ -153,7 +155,7 @@ XONE_VALUE_MAP = {
     1: (-32768, 32767),
     2: (0, 1023),
     3: (-32768, 32767),
-    4: (-32768, -32767),
+    4: (-32768, 32767),
     5: (0, 1023),
     6: (-1, 1),
     7: (-1, 1)
@@ -175,7 +177,7 @@ class JoystickRos2(Node):
         # Node params
         # TODO : use rosparam
         self.deadzone = 0.05
-        self.autorepeat_rate = 0.0
+        self.autorepeat_rate = 30.0
         self.coalesce_interval = 0.001
         self.sleep_time = 0.01
 
@@ -187,11 +189,12 @@ class JoystickRos2(Node):
         self.joy.buttons = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
         # Joy publisher
-        self.publisher_ = self.create_publisher(Joy, 'joy', 10)
+        self.publisher_ = self.create_publisher(Joy, 'joy0', 10)
 
         # logic params
         self.last_event = None
         self.last_publish_time = 0
+        self.event_queue = queue.Queue()
 
     def publish_joy(self):
         current_time = modf(time.time())
@@ -208,7 +211,7 @@ class JoystickRos2(Node):
         else:
             return 0.0
 
-    def run(self):
+    def gamepad_listener(self):
         device_manager = devices
         while rclpy.ok():
             # get the first joystick
@@ -248,26 +251,40 @@ class JoystickRos2(Node):
                     break
                 if events:
                     for event in events:
-                        if (event.code in JOYSTICK_CODE_VALUE_MAP[event.device.name][0]):
-                            key_code = JOYSTICK_CODE_VALUE_MAP[event.device.name][0][event.code]
-                            if (event.ev_type == 'Key'):
-                                self.joy.buttons[key_code] = event.state
-                                self.publish_joy()
-                                self.last_event = event
-                            elif (event.ev_type == 'Absolute'):
-                                value_range = JOYSTICK_CODE_VALUE_MAP[event.device.name][1][key_code]
-                                self.joy.axes[key_code] = self.normalize_key_value(value_range[0], value_range[1], event.state)
-                                if (self.last_event is None) or (self.last_event.code != event.code) or (time.time() - self.last_publish_time > self.coalesce_interval):
-                                    self.publish_joy()
-                                self.last_event = event
+                        self.event_queue.put(event)
                 else:
                     break
-            ## autorepeat
-            if ((self.autorepeat_rate > 0.0) and (time.time() - self.last_publish_time > 1/self.autorepeat_rate)):
-                self.publish_joy()
+
+    def run(self):
+        # Start the listener thread
+        listener_thread = threading.Thread(target=self.gamepad_listener, daemon=True)
+        listener_thread.start()
+
+        while True:
+            try:
+                event = self.event_queue.get(block=True, timeout=1/self.autorepeat_rate)
+                #print(f"Event: {event}")
+                if (event.code in JOYSTICK_CODE_VALUE_MAP[event.device.name][0]):
+                    key_code = JOYSTICK_CODE_VALUE_MAP[event.device.name][0][event.code]
+                    if (event.ev_type == 'Key'):
+                        self.joy.buttons[key_code] = event.state
+                        self.publish_joy()
+                        self.last_event = event
+                    elif (event.ev_type == 'Absolute'):
+                        value_range = JOYSTICK_CODE_VALUE_MAP[event.device.name][1][key_code]
+                        self.joy.axes[key_code] = self.normalize_key_value(value_range[0], value_range[1], event.state)
+                        if (self.last_event is None) or (self.last_event.code != event.code) or (time.time() - self.last_publish_time > self.coalesce_interval):
+                            self.publish_joy()
+                        self.last_event = event
+            except queue.Empty:
+                #print("test autorepeat")
+                if ((self.autorepeat_rate > 0.0) and (time.time() - self.last_publish_time > 1/self.autorepeat_rate)):
+                    #print("autorepeat")
+                    self.publish_joy()
+                pass
 
             # sleep to decrease cpu usage
-            time.sleep(self.sleep_time)
+            # time.sleep(self.sleep_time)
 
 def main(args=None):
     rclpy.init(args=args)
